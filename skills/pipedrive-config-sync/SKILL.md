@@ -177,8 +177,12 @@ A condition is `["<field>", "<operator>"]` or `["<field>", "<operator>", "<value
   `add_time`, `value`, …) or a custom field's **exact name** (e.g. `"Stripe Payment
   status"`). The script resolves it to the numeric `field_id` from live `dealFields`,
   so ids are never hardcoded.
-- **enum `<value>`** is the option **label** (e.g. `"Refunded"`, `"C3"`, `"Monthly"`);
-  it is resolved to the numeric option id automatically.
+- **enum `<value>`** is the option **label** (e.g. `"Refunded"`, `"C3"`, `"Monthly"`),
+  resolved to the numeric option id automatically and **case-insensitively** (`"refunded"`
+  matches `"Refunded"` - source systems rarely agree on casing). You may also pass the raw
+  option id. An **unknown** option label is a hard error that lists the valid options: the
+  skill refuses to send the raw string, which the filter API would silently turn into a
+  filter that matches nothing.
 - Pipedrive enum conditions only support `=`, so an **"is one of A, B"** set must go in
   the `or` array - the filter evaluates as `(and group) AND (or group)`. Put shared
   constraints (e.g. `pipeline = 6`) in `and` and the alternatives in `or`.
@@ -298,6 +302,11 @@ phase placement lives in the project **plan**, not on the task's own `phase_id` 
   it won't flag drift in those. If an automation depends on one of them, verify it by
   hand. (These are the entities a full-environment *installer* creates but this
   verify-focused skill deliberately doesn't mirror.)
+- **Rate limits.** The HTTP helpers read Pipedrive's `x-ratelimit-remaining` /
+  `x-ratelimit-reset` headers and pause when the per-company window is nearly spent. This
+  matters because under a burst Pipedrive can return an **empty HTTP-200 body instead of a
+  429** - which would otherwise read as "nothing configured". If you script large loops on
+  top of these helpers, keep relying on them rather than firing raw requests.
 
 ## API version policy (v1 CRUD deprecation)
 

@@ -122,6 +122,101 @@ curl -s -X PUT -H "x-api-token: $TOKEN" -H "Content-Type: application/json" \
   -d "{\"options\": $NEW_OPTIONS}"
 ```
 
+## Field-observed behaviors (production, API v2)
+
+Behaviors observed in production against API v2 (mid-2026) while building a two-way sync,
+most either undocumented or documented less specifically. Instance-specific details have been
+stripped. Pipedrive ships behavior changes without changelog entries, so re-verify against a
+current sandbox before encoding any of these as a hard rule.
+
+### Custom-field value shapes (don't infer from the native field)
+
+A wrong shape returns `400 ERR_SCHEMA_VALIDATION_FAILED` naming the expected type.
+
+- **`time`** custom fields take an **object**: `{"value": "HH:MM:SS"}`; a bare `"14:30:00"`
+  is rejected. (The `phone` and set/multi-option shapes are covered under "Custom fields" above.)
+- **Timezone:** date/time values are stored and returned in the **account's** timezone, with no
+  offset echoed back. Normalize before diffing a stored time against a UTC source.
+
+### Native vs custom is a *placement* fork, not just naming
+
+A 40-hex key goes inside `custom_fields`; anything else is a **top-level** payload property.
+Getting this wrong **fails silently** - the write returns success and the value lands nowhere.
+Prefer the native target where one exists (it drives UI features the custom shadow doesn't):
+person address -> native `postal_address` (an object); phone/email -> native `phones`/`emails`
+arrays. Audit any mapping layer for custom fields that shadow a native field.
+
+### Reads omit fields; omitted is indistinguishable from unset
+
+See "Reading custom fields on a person" above for the mechanics. The trap: a field you forgot
+to request reads empty, so a **read-modify-write** concludes "unset" and overwrites a real
+value. Any RMW against v2 needs an explicit field list - `?custom_fields=<hash>,<hash>` for
+custom fields and `?include_fields=<name>` for omitted native ones (e.g. `marketing_status`).
+
+### Enum options: resolve case-insensitively, fail on a miss
+
+Option labels must match exactly on the wire, but source systems disagree on casing (`TSgt`
+vs `TSGT`). Normalize `lower(trim(...))` on both sides. On an unresolved label, **omit the
+field** (record writes) or **raise a clear error** (filter conditions) rather than sending the
+raw string - a bad value 400s the request or writes garbage. `filters ensure` in this repo now
+does exactly this. Any option-id lookup table also goes stale when someone edits options in the
+UI - which is what the drift check is for.
+
+### Deals: two rules that only bite on update (invisible to create-only integrations)
+
+- A deal with a **product attached** rejects native `value`/`currency` updates
+  (`ERR_DEAL_WITH_PRODUCTS_CANT_UPDATE_VALUE`) - the product line owns the amount. Set
+  `value`/`currency` **create-only**; carry the figure in a custom field for updates.
+- **Archiving is a field update:** `PATCH /api/v2/deals/{id}` `{"is_archived": true}`. There is
+  no archive endpoint.
+
+### Notes (v1): no client key, but updatable by id
+
+There is no upsert and no client-supplied idempotency key, so a naive re-sync duplicates every
+note. But `PUT /v1/notes/{id}` edits in place, so **persist the returned note id** against your
+own record and update on later syncs. Fallback when the id wasn't stored: list the parent's
+notes, delete the ones you wrote (matched on a marker you control in the body), re-create - 3+
+calls, briefly note-less, fragile. Notes can be **backdated** via `add_time`
+(`"YYYY-MM-DD HH:MM:SS"`). **Generalizable:** for any child object with no natural key (notes,
+activities, files), capture the id the create call returns and store it - retrofitting later is
+a list-and-match migration.
+
+### Deletion semantics
+
+- **Person deletion is a soft delete** - the record still reads back with `is_deleted: true`
+  (the reliable way to confirm a bulk delete actually completed).
+- **Deleting a person does not delete their deals** - they survive as orphans with a dangling
+  `person_id`. On any restore, **rewire the existing deal** (a `PATCH` carrying the new
+  `person_id`) rather than creating a replacement, or every restore doubles the deal count.
+
+### Webhooks: merges arrive as delete + change (system-of-record consumers)
+
+A merge emits a **`delete` on the loser** and a **`change` on the winner** - there is no
+`action: "merge"`, so code branching on one is dead code. The linkage is in the event `meta`:
+`merged_to_id` (loser) / `merged_from_id` (winner). Miss it and you keep references to deleted
+ids -> a permanent 404 loop on later writes. API-performed merges are attributed to **your own
+API user**, so a self-echo guard (`change_source == "api" AND user_id == <ours>`) eats both
+events - exempt any event carrying a merged id. Separately, `marketing_status` is **absent from
+person webhooks entirely** and is **billed per subscriber**, so a GET-before-write is mandatory
+and it is a state machine, not a boolean (never overwrite `unsubscribed` / `bounced` /
+`pending_upgrade`).
+
+### Bulk / backfill
+
+Every field backfill is one write per record. **Hash the outbound payload and skip unchanged
+records** so a full re-sync only touches genuinely-changed rows; for a new field on a large
+population, **passive convergence** (fill as each record next changes) often beats a bulk pass.
+Drive batches from a resumable queue with per-record error isolation, not a single "walk
+everything" pass that aborts on one transient error.
+
+### Coverage gaps
+
+- **No public Campaigns API** - per-campaign aggregates come only from the internal insights
+  gateway behind a per-report hash: unversioned, undocumented, and dead the moment that shared
+  report is regenerated. Treat anything built on it as a scrape and isolate it.
+- **No suffix / post-nominal field on persons** by default - create the destination field first
+  if a source system carries one.
+
 ## Rate limiting
 
 Pipedrive uses token-based rate limiting per company; v2 endpoints cost ~50% fewer tokens
@@ -130,6 +225,14 @@ limit:
 
 - `x-ratelimit-remaining` - requests left in the current window
 - `x-ratelimit-reset` - seconds until the window resets
+
+**It fails quietly.** Under a burst, requests can come back **empty rather than erroring** (an
+empty HTTP-200 body, not a 429). A tight verification loop after a batch of writes then reports
+"nothing landed" when everything landed - a false negative that invites a destructive re-run.
+Space verification reads (~1.5s between calls was enough in practice), prefer your **own
+persisted state** as the success signal, and treat Pipedrive reads as confirmation of a sample.
+`pipedrive-sync.mjs` reads these headers in its HTTP helpers and pauses when the window is
+nearly spent.
 
 ## References
 

@@ -159,9 +159,31 @@ function loadToken() {
 }
 
 /* ------------------------------------------------------------------ http */
-function httpsGetJson(url, token) {
+/* Rate limiting (docs/pipedrive-api.md): Pipedrive is token-bucketed per company and the
+   responses carry x-ratelimit-remaining / x-ratelimit-reset. Under a burst it can also return
+   an empty-but-HTTP-200 body instead of a 429 - which a naive reader mistakes for "nothing
+   there". We record the headers after every response and, when the window is nearly spent,
+   wait for it to reset before the next request, staying out of that quiet-failure regime. */
+const rateState = { remaining: Infinity, resetAt: 0 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function noteRateHeaders(headers) {
+  const rem = Number(headers['x-ratelimit-remaining']);
+  const reset = Number(headers['x-ratelimit-reset']);
+  if (Number.isFinite(rem)) rateState.remaining = rem;
+  if (Number.isFinite(reset) && reset > 0) rateState.resetAt = Date.now() + reset * 1000;
+}
+async function rateWaitIfNeeded() {
+  if (rateState.remaining <= 1 && rateState.resetAt > Date.now()) {
+    await sleep(Math.min(rateState.resetAt - Date.now() + 100, 10000));
+    rateState.remaining = Infinity; // assume the window has reset
+  }
+}
+
+async function httpsGetJson(url, token) {
+  await rateWaitIfNeeded();
   return new Promise((resolve, reject) => {
     const req = https.get(url, { headers: { 'x-api-token': token, Accept: 'application/json' } }, (res) => {
+      noteRateHeaders(res.headers);
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -215,7 +237,8 @@ async function fetchAllV1(path, token, extra = {}) {
 }
 
 /* POST/DELETE for the v1 write endpoints (filters). GET stays on httpsGetJson. */
-function httpsSendJson(method, url, token, bodyObj) {
+async function httpsSendJson(method, url, token, bodyObj) {
+  await rateWaitIfNeeded();
   return new Promise((resolve, reject) => {
     const data = bodyObj ? Buffer.from(JSON.stringify(bodyObj)) : null;
     const req = https.request(url, {
@@ -225,6 +248,7 @@ function httpsSendJson(method, url, token, bodyObj) {
         ...(data ? { 'Content-Type': 'application/json', 'Content-Length': data.length } : {}),
       },
     }, (res) => {
+      noteRateHeaders(res.headers);
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -292,12 +316,33 @@ async function buildDealFieldIndex(token) {
   const byName = new Map(); // exact field name -> rec
   const byKey = new Map();  // api key (standard key or hash) -> rec
   for (const f of raw) {
-    const options = new Map((f.options || []).map((o) => [String(o.label), String(o.id)]));
-    const rec = { id: String(f.id), type: f.field_type, name: f.name, key: f.key, options };
+    const opts = f.options || [];
+    const options = new Map(opts.map((o) => [String(o.label), String(o.id)]));                        // exact label -> id
+    const optionsCI = new Map(opts.map((o) => [String(o.label).trim().toLowerCase(), String(o.id)])); // case-insensitive label -> id
+    const optionIds = new Set(opts.map((o) => String(o.id)));                                          // accept a raw option id too
+    const rec = { id: String(f.id), type: f.field_type, name: f.name, key: f.key, options, optionsCI, optionIds, hasOptions: opts.length > 0 };
     if (f.name) byName.set(f.name, rec);
     if (f.key) byKey.set(f.key, rec);
   }
   return { byName, byKey };
+}
+
+/* Resolve a condition value to what the filter API expects. For enum/set fields that means a
+   numeric option id: match the option LABEL case-insensitively (source systems disagree on
+   casing - "TSgt" vs "TSGT"), accept a raw option id as-is, and fail LOUDLY on an unresolved
+   label rather than passing the raw string through - which the filter API would silently turn
+   into a filter that matches nothing. Non-option fields (text, date, numeric, relational ids
+   like pipeline/stage_id) pass through unchanged. */
+function resolveOptionValue(rec, val, ref) {
+  const s = String(val);
+  if (!rec.hasOptions) return s;
+  if (rec.options.has(s)) return rec.options.get(s);          // exact label
+  const ci = rec.optionsCI.get(s.trim().toLowerCase());
+  if (ci) return ci;                                          // case-insensitive label
+  if (rec.optionIds.has(s)) return s;                         // already an option id
+  const sample = [...rec.options.keys()].slice(0, 8).map((l) => `"${l}"`).join(', ');
+  throw new Error(`Option "${val}" not found on field "${ref}" (matching is case-insensitive). ` +
+    `Known options: ${sample}${rec.options.size > 8 ? ', …' : ''}. Use one of those labels or the option id.`);
 }
 
 function resolveCondition(idx, cond) {
@@ -305,9 +350,7 @@ function resolveCondition(idx, cond) {
   const rec = idx.byKey.get(STD_ALIAS[ref] || ref) || idx.byKey.get(ref) || idx.byName.get(ref);
   if (!rec) throw new Error(`Unknown deal field: "${ref}"`);
   if (NO_VALUE_OPS.has(operator)) return { object: 'deal', field_id: rec.id, operator, value: null, extra_value: null };
-  // enum/set: translate an option label to its numeric id; otherwise pass the value through
-  const value = rec.options.has(String(val)) ? rec.options.get(String(val)) : String(val);
-  return { object: 'deal', field_id: rec.id, operator, value, extra_value: null };
+  return { object: 'deal', field_id: rec.id, operator, value: resolveOptionValue(rec, val, ref), extra_value: null };
 }
 
 function buildConditions(idx, spec) {
