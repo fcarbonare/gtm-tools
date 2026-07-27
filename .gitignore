@@ -141,3 +141,11 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# macOS
+.DS_Store
+
+# Private / local-only assets — never distributed from this repo.
+# Home for third-party or client-shared tooling that lives here for reference
+# but must not be published (keep its provenance in the folder's own README).
+/private/

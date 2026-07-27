@@ -21,8 +21,11 @@
  *
  * API surface:
  *   auth   : x-api-token header -> api.pipedrive.com
- *   fields : dealFields/personFields/organizationFields/activityFields/productFields (v2, cursor),
- *            leadFields (v1, offset), projectFields (v2 beta, cursor; optional)
+ *   fields : dealFields/personFields/organizationFields/activityFields/productFields (v2, cursor;
+ *            custom fields keyed by `field_code`, companion subfields nested under `subfields`),
+ *            leadFields (v1, offset), projectFields (v2 beta, cursor; optional).
+ *            NB: the v2 field endpoints omit the numeric field/option ids that filters need, so
+ *            buildDealFieldIndex() deliberately reads v1 dealFields for the filters path.
  *   config : pipelines (v2), stages (v2), activityTypes (v1), boards + phases (v2 beta; optional)
  *   filters: filters (v1, GET/POST)
  *   projects: boards + phases (v2, GET/POST); templates/tasks/plan (v1)
@@ -42,10 +45,10 @@
  *   node pipedrive-sync.mjs                # check for drift, exit 1 if any
  *   node pipedrive-sync.mjs --write        # refresh local mirror files from live
  *   node pipedrive-sync.mjs --json         # machine-readable drift report
- *   node pipedrive-sync.mjs filters list    # list deal filters (list views)
- *   node pipedrive-sync.mjs filters ensure  # create filters from <mirror>/filters.json (idempotent)
- *   node pipedrive-sync.mjs projects list    # list project boards + phases
- *   node pipedrive-sync.mjs projects ensure  # create boards + phases from <mirror>/projects.json (idempotent)
+ *   node pipedrive-sync.mjs filters list             # list deal filters (list views)
+ *   node pipedrive-sync.mjs filters ensure [--dry-run]   # create filters from <mirror>/filters.json (idempotent)
+ *   node pipedrive-sync.mjs projects list            # list project boards + phases
+ *   node pipedrive-sync.mjs projects ensure [--dry-run]  # create boards + phases from <mirror>/projects.json (idempotent)
  *
  * Token: PIPEDRIVE_API_TOKEN in the environment, or in .env / .env.local at the project
  * root or in the mirror dir (all gitignored; .env.local wins). The token is sent only to
@@ -80,12 +83,18 @@ const PROJECT_ROOT = basename(MIRROR_DIR) === 'pipedrive' ? dirname(MIRROR_DIR) 
 const BASE_V2 = 'https://api.pipedrive.com/api/v2';
 const BASE_V1 = 'https://api.pipedrive.com/v1';
 
-/* Entities whose fields we mirror. Lead fields live on v1; the rest on v2.
-   Project fields are a v2 beta endpoint that keys custom fields by `field_code`
-   (a 40-char hash, same shape as other entities' `key`) and may be disabled on a
-   given account - so it is marked `optional`: if the fetch fails we warn and skip
-   it rather than aborting the whole drift check, and we never treat local Project
-   rows as deleted just because the endpoint was unavailable this run. */
+/* Entities whose fields we mirror. Lead fields live on v1; the rest on v2. The v2 field
+   endpoints (verified live) return custom fields keyed by `field_code` (40-char hash, same
+   shape as v1's `key`), the label as `field_name`, and nest companion subfields such as
+   `<hash>_currency` under a `subfields` array instead of listing them as separate fields -
+   which is why the drift inventory uses v2 (v1 surfaces those companions as top-level
+   fields and would report perpetual false drift). buildDealFieldIndex() separately reads
+   v1 dealFields for the *filters* path, because the v2 field endpoints omit the numeric
+   field/option ids that filter conditions require.
+   Project fields are a v2 beta endpoint that keys custom fields by `field_code` and may be
+   disabled on a given account - so it is marked `optional`: if the fetch fails we warn and
+   skip it rather than aborting the whole drift check, and we never treat local Project rows
+   as deleted just because the endpoint was unavailable this run. */
 const ENTITIES = [
   { name: 'Deal',         path: 'dealFields',         v1: false },
   { name: 'Person',       path: 'personFields',       v1: false },
@@ -111,6 +120,13 @@ const TYPE_LABEL = {
 };
 
 const HASH_RE = /^[0-9a-f]{40}$/; // custom-field key shape
+// Companion SUBFIELD of a custom field: the 40-char hash plus a suffix, e.g.
+// `<hash>_currency` (monetary), `<hash>_until` (range end), `<hash>_locality` (address part).
+// The v2 field endpoints nest these under a `subfields` array; the v1 endpoints (leadFields)
+// list them as separate top-level fields. They are not independently-managed custom fields and
+// HASH_RE can't reconcile them, so we drop them in fetchLive to keep v1 and v2 consistent and
+// avoid perpetual false "NEW custom field" drift.
+const COMPANION_RE = /^[0-9a-f]{40}_[a-z0-9_]+$/;
 
 /* ------------------------------------------------------------------ args */
 const ARGV = process.argv.slice(2);
@@ -118,6 +134,10 @@ const SUBCMD = ARGV[0] && !ARGV[0].startsWith('-') ? ARGV[0] : null;
 const ARGS = new Set(ARGV);
 const WRITE = ARGS.has('--write');
 const JSON_OUT = ARGS.has('--json');
+// --dry-run makes `filters ensure` / `projects ensure` resolve and validate everything
+// against live config (read-only) but create nothing. No effect on the drift check, which
+// is already read-only.
+const DRY_RUN = ARGS.has('--dry-run');
 
 /* ------------------------------------------------------------------ env */
 function loadToken() {
@@ -313,15 +333,19 @@ async function ensureFilters(token) {
   const existing = await fetchAllV1('filters', token, { type: 'deals' });
   const have = new Set(existing.map((f) => f.name));
   let created = 0, skipped = 0;
-  console.log(`Ensuring ${specs.length} deal filter(s) from ${FILTERS_JSON}:`);
+  console.log(`Ensuring ${specs.length} deal filter(s) from ${FILTERS_JSON}${DRY_RUN ? ' [dry-run]' : ''}:`);
   for (const spec of specs) {
     if (have.has(spec.name)) { console.log(`  skip (exists)   ${spec.name}`); skipped++; continue; }
+    // buildConditions runs in dry-run too: it resolves field names / option labels against
+    // live dealFields, so an unknown field or option surfaces here instead of at write time.
     const body = { name: spec.name, type: 'deals', visible_to: visibleTo, conditions: buildConditions(idx, spec) };
+    if (DRY_RUN) { console.log(`  would create    ${spec.name}`); created++; continue; }
     const j = await httpsSendJson('POST', `${BASE_V1}/filters`, token, body);
     console.log(`  created #${j.data.id}   ${spec.name}`);
     created++;
   }
-  console.log(`\nDone. ${created} created, ${skipped} skipped (already existed). visible_to=${visibleTo}.`);
+  if (DRY_RUN) console.log(`\n[dry-run] ${created} filter(s) would be created, ${skipped} already exist. No filters were written. visible_to=${visibleTo}.`);
+  else console.log(`\nDone. ${created} created, ${skipped} skipped (already existed). visible_to=${visibleTo}.`);
 }
 
 /* --------------------------------------------------------- project structure */
@@ -397,10 +421,12 @@ async function ensureProjectStructure(token) {
   let boardsCreated = 0, boardsSkipped = 0, phasesCreated = 0, phasesSkipped = 0;
   let projCreated = 0, projSkipped = 0, tasksCreated = 0, tasksSkipped = 0, tasksPlaced = 0;
 
-  console.log(`Ensuring ${wanted.length} project board(s) from ${PROJECTS_JSON}:`);
+  console.log(`Ensuring ${wanted.length} project board(s) from ${PROJECTS_JSON}${DRY_RUN ? ' [dry-run]' : ''}:`);
   for (const wb of wanted) {
     let board = boardByName.get(wb.name);
+    let boardPending = false; // dry-run: board would be created, so it has no real id/phases yet
     if (board) { console.log(`  board skip (exists)   #${board.id}  ${wb.name}`); boardsSkipped++; }
+    else if (DRY_RUN) { console.log(`  board would create    ${wb.name}`); boardsCreated++; boardPending = true; }
     else {
       const body = { name: wb.name, ...(wb.order_nr != null ? { order_nr: wb.order_nr } : {}) };
       const j = await httpsSendJson('POST', `${BASE_V2}/boards`, token, body);
@@ -409,11 +435,12 @@ async function ensureProjectStructure(token) {
       console.log(`  board created         #${board.id}  ${wb.name}`);
       boardsCreated++;
     }
-    // phases for this board, matched by name
-    const livePhases = await fetchAllV2('phases', token, { board_id: board.id });
+    // phases for this board, matched by name (a pending dry-run board has no live phases)
+    const livePhases = boardPending ? [] : await fetchAllV2('phases', token, { board_id: board.id });
     const havePhase = new Set(livePhases.map((p) => p.name));
     for (const wp of wb.phases) {
       if (havePhase.has(wp.name)) { console.log(`      phase skip (exists)  ${wp.name}`); phasesSkipped++; continue; }
+      if (DRY_RUN) { console.log(`      phase would create  ${wp.name}`); phasesCreated++; havePhase.add(wp.name); continue; }
       const body = { name: wp.name, board_id: board.id, ...(wp.order_nr != null ? { order_nr: wp.order_nr } : {}) };
       const j = await httpsSendJson('POST', `${BASE_V2}/phases`, token, body);
       console.log(`      phase created #${j.data.id}  ${wp.name}`);
@@ -422,15 +449,34 @@ async function ensureProjectStructure(token) {
     }
     // optional reference project: a project card pre-loaded with the task checklist
     if (wb.referenceProject) {
-      const finalPhases = await fetchAllV2('phases', token, { board_id: board.id });
-      const phaseIdByName = new Map(finalPhases.map((p) => [p.name, p.id]));
-      const r = await ensureReferenceProject(token, board.id, wb.phases, wb.referenceProject, phaseIdByName, templateTitles);
-      projCreated += r.projCreated; projSkipped += r.projSkipped;
-      tasksCreated += r.tasksCreated; tasksSkipped += r.tasksSkipped; tasksPlaced += r.tasksPlaced;
+      if (DRY_RUN) {
+        const rp = wb.referenceProject;
+        if (templateTitles.has(rp.title)) { console.log(`    ref project skip (template already saved) ${rp.title}`); projSkipped++; }
+        else {
+          // a matching reference project can only pre-exist when the board is real
+          let exists = false;
+          if (!boardPending) {
+            try { const live = await fetchAllV2('projects', token, { board_id: board.id }); exists = live.some((p) => p.title === rp.title); } catch (_) {}
+          }
+          if (exists) { console.log(`    ref project skip (exists) ${rp.title}`); projSkipped++; }
+          else { console.log(`    ref project would create  ${rp.title}  (${rp.tasks.length} task(s))`); projCreated++; tasksCreated += rp.tasks.length; }
+        }
+      } else {
+        const finalPhases = await fetchAllV2('phases', token, { board_id: board.id });
+        const phaseIdByName = new Map(finalPhases.map((p) => [p.name, p.id]));
+        const r = await ensureReferenceProject(token, board.id, wb.phases, wb.referenceProject, phaseIdByName, templateTitles);
+        projCreated += r.projCreated; projSkipped += r.projSkipped;
+        tasksCreated += r.tasksCreated; tasksSkipped += r.tasksSkipped; tasksPlaced += r.tasksPlaced;
+      }
     }
   }
-  console.log(`\nDone. Boards: ${boardsCreated} created, ${boardsSkipped} skipped. Phases: ${phasesCreated} created, ${phasesSkipped} skipped.` +
-    (projCreated + projSkipped ? ` Reference projects: ${projCreated} created, ${projSkipped} skipped; tasks: ${tasksCreated} created, ${tasksSkipped} skipped, ${tasksPlaced} placed in phase.` : ''));
+  if (DRY_RUN) {
+    console.log(`\n[dry-run] No boards/phases/projects were written. Boards: ${boardsCreated} would create, ${boardsSkipped} skipped. Phases: ${phasesCreated} would create, ${phasesSkipped} skipped.` +
+      (projCreated + projSkipped ? ` Reference projects: ${projCreated} would create, ${projSkipped} skipped; tasks: ${tasksCreated} would create.` : ''));
+  } else {
+    console.log(`\nDone. Boards: ${boardsCreated} created, ${boardsSkipped} skipped. Phases: ${phasesCreated} created, ${phasesSkipped} skipped.` +
+      (projCreated + projSkipped ? ` Reference projects: ${projCreated} created, ${projSkipped} skipped; tasks: ${tasksCreated} created, ${tasksSkipped} skipped, ${tasksPlaced} placed in phase.` : ''));
+  }
 }
 
 /* Create (idempotently) a reference project on a board, pre-loaded with the task
@@ -558,6 +604,7 @@ async function fetchLive(token) {
     for (const f of raw) {
       const key = liveKey(f);
       if (!key) continue;
+      if (COMPANION_RE.test(key)) continue; // drop companion subfields (see COMPANION_RE)
       const rec = { entity: e.name, key, label: liveLabel(f), type: liveType(f), custom: isCustom(f), options: [] };
       fields.set(`${e.name}::${key}`, rec);
       for (const o of f.options || []) {

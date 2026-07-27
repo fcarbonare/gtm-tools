@@ -21,13 +21,20 @@ or a secrets manager. Never hardcode or print them.
 Pipedrive runs two API versions and some endpoints exist in only one.
 
 - **v2** (`/api/v2/`): entity CRUD (persons, deals, organizations, products, pipelines,
-  stages, activities), plus Projects (boards, phases, fields). Set / multi-option fields
-  expect an **array of integer option ids** (e.g. `[117, 234]`), not a comma-separated
-  string. Cursor pagination (`limit` up to 500, `cursor`).
-- **v1** (`/v1/`): the endpoints with no v2 successor yet - field definitions, filters,
-  activity types, notes, users, recents, merge, undelete, and the project
-  templates/tasks/plan endpoints. Field-definition endpoints return everything in one
-  response (offset pagination where paginated at all).
+  stages, activities), Projects (boards, phases, fields), **and field-definition endpoints**
+  (`/api/v2/dealFields`, `personFields`, `organizationFields`, `productFields`,
+  `activityFields` - verified live). v2 field endpoints key custom fields by `field_code`
+  (the 40-char hash), carry the label as `field_name`, expose `is_custom_field`, and nest
+  companion subfields (`<hash>_currency`, address parts, range ends) under a `subfields`
+  array instead of listing them separately. Set / multi-option fields expect an **array of
+  integer option ids** (e.g. `[117, 234]`), not a comma-separated string. Cursor pagination
+  (`limit` up to 500, `cursor`).
+- **v1** (`/v1/`): filters, activity types, notes, users, recents, merge, undelete, and the
+  project templates/tasks/plan endpoints. The v1 **field-definition** endpoints also remain
+  useful even though v2 has them: v1 exposes the **numeric** field id and option ids that v2
+  omits (needed to resolve filter conditions) and lists companion subfields as separate rows.
+  Field-definition endpoints are **not** on the v1 CRUD deprecation list, so either version is
+  sunset-safe. v1 returns everything in one response (offset pagination where paginated at all).
 
 ### v1 CRUD deprecation - use v2 for anything CRUD
 
@@ -39,11 +46,11 @@ them as gone and target `/api/v2` for all of these entities.
 
 **Do not reintroduce a v1 CRUD call**, including for one-off debugging.
 
-The v1 calls that legitimately remain (no v2 successor):
+The v1 calls that legitimately remain:
 
 | Still v1 | Why |
 |---|---|
-| `/v1/{entity}Fields` | v2 has no field-definition endpoints |
+| `/v1/{entity}Fields` | v2 field endpoints exist but omit the **numeric** field/option ids filters need; use v2 for the field/option inventory, v1 to resolve filter conditions. Not on the deprecation list. |
 | `/v1/filters` | no v2 filters endpoint |
 | `/v1/activityTypes` | not on the deprecation list; no v2 equivalent |
 | `/v1/notes` | notes were never migrated |
@@ -84,8 +91,11 @@ that blindly reads `.data.<hash>` prints empty for every field and looks like a 
 ## Custom fields
 
 Custom fields are identified by a 40-char hash key (e.g.
-`583f4da237dd96220c7f4f57c88332635e52cd27`). Definitions, keys, and option ids come from
-`GET /v1/{entity}Fields`.
+`583f4da237dd96220c7f4f57c88332635e52cd27`). Definitions and option **labels** come from
+either version - `GET /api/v2/{entity}Fields` (custom fields under `field_code`, label under
+`field_name`, companions nested in `subfields`) or `GET /v1/{entity}Fields` (custom fields
+under `key`, label under `name`). Only v1 also returns the **numeric** field id and option
+ids, which filter conditions need.
 
 - **Set / multi-option** fields: array of integer option ids in v2, e.g.
   `{"<hash>": [884, 891, 923]}`. Comma-separated strings return a 400.

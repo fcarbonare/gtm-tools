@@ -87,10 +87,12 @@ SYNC=~/.claude/skills/pipedrive-config-sync/pipedrive-sync.mjs
 node $SYNC                  # drift check: report differences, exit 1 if any, 0 if in sync
 node $SYNC --write          # refresh local mirrors from live (also pipelines/stages/activity_types.csv)
 node $SYNC --json           # same check, machine-readable JSON
-node $SYNC filters list     # list deal filters (saved list views) with their ids
-node $SYNC filters ensure   # create the filters defined in pipedrive/filters.json (idempotent)
-node $SYNC projects list    # list project boards and their phases with ids
-node $SYNC projects ensure  # create boards + phases + reference projects/tasks from pipedrive/projects.json (idempotent)
+node $SYNC filters list             # list deal filters (saved list views) with their ids
+node $SYNC filters ensure           # create the filters defined in pipedrive/filters.json (idempotent)
+node $SYNC filters ensure --dry-run # preview: resolve/validate against live, create nothing
+node $SYNC projects list            # list project boards and their phases with ids
+node $SYNC projects ensure          # create boards + phases + reference projects/tasks from pipedrive/projects.json (idempotent)
+node $SYNC projects ensure --dry-run # preview what would be created, write nothing
 ```
 
 The local mirror files the script maintains, in the project's `pipedrive/`:
@@ -146,6 +148,12 @@ mechanism is Pipedrive's native `lost_reason` field. Always verify field names a
 filters defined in the project's `pipedrive/filters.json` and is **idempotent** - it
 skips any filter whose name already exists, so it is safe to re-run. Filters default to
 `visible_to: "7"` (entire company) so the whole team sees them.
+
+Add **`--dry-run`** to preview first: it fetches live `dealFields` and existing filters,
+resolves every condition (field names -> ids, option labels -> option ids) and reports
+which filters *would* be created - but writes nothing. An unknown field or option label
+surfaces here, before any filter is created. Use it whenever you want the installer-style
+"show me what will happen" safety check.
 
 `filters.json` is either a bare array of filter specs, or an object with an optional
 `visible_to`:
@@ -205,7 +213,9 @@ API, currently **in beta**). The skill covers all three:
 boards, phases, and (optionally) **reference projects with task checklists** from the
 project's `pipedrive/projects.json` and is **idempotent** - a board is matched by name,
 a phase by (board, name), a reference project by title, and a task by title; only
-missing items are created, and nothing is renamed, reordered, or deleted.
+missing items are created, and nothing is renamed, reordered, or deleted. Add
+**`--dry-run`** to report what would be created (boards, phases, reference projects and
+their task counts) without writing anything.
 
 `projects.json` is either a bare array of boards, or an object with a `boards` array.
 A phase is a plain string (name only) or an object `{ "name", "order_nr" }`. A board
@@ -282,6 +292,12 @@ phase placement lives in the project **plan**, not on the task's own `phase_id` 
   check warns and skips them without failing; `projects list` / `projects ensure` exit
   with a clear "beta may be disabled" message. Don't work around this - it means the
   account can't use the Projects API yet.
+- **Scope of the drift check.** It covers custom fields + options (all entities incl.
+  Project), pipelines, stages, activity types, and boards/phases. It does **not** track
+  goals, roles, teams, webhooks, lead labels, or seed records (orgs/persons/deals) - so
+  it won't flag drift in those. If an automation depends on one of them, verify it by
+  hand. (These are the entities a full-environment *installer* creates but this
+  verify-focused skill deliberately doesn't mirror.)
 
 ## API version policy (v1 CRUD deprecation)
 
@@ -300,11 +316,14 @@ What this means for anyone extending this skill or writing sibling scripts:
   hashes you need via `?custom_fields=<hash>,<hash>` (v2 omits custom fields otherwise;
   `?include_fields=custom_fields` is **not** valid for persons and returns a schema
   error).
-- **The v1 calls this skill still makes are deliberate** - they are the ones with no v2
-  successor: field definitions (`{entity}Fields`), `filters`, `activityTypes`, and the
-  project `templates` / `tasks` / `plan` endpoints. `activityTypes` is **not** on the
-  deprecation list. Pipelines and stages **are**, and this skill already reads both from
-  v2.
+- **The v1 calls this skill still makes are deliberate.** `filters`, `activityTypes`, and
+  the project `templates` / `tasks` / `plan` endpoints have no v2 successor. Field
+  definitions are the nuanced case: the drift check reads them from **v2**
+  (`/api/v2/{entity}Fields` - custom fields under `field_code`, companion subfields nested in
+  `subfields`), but the **filters** path reads v1 `dealFields` because only v1 returns the
+  numeric field/option ids that filter conditions need. Field endpoints are **not** on the
+  deprecation list, so both are safe. `activityTypes` is **not** on the list either.
+  Pipelines and stages **are**, and this skill already reads both from v2.
 - **Auth:** always the `x-api-token` header, never the token as a query parameter (it
   leaks into logs and URLs). This script already does this and never prints the token.
 - **A failed request still returns HTTP-200-shaped JSON with `success:false`**, so a
