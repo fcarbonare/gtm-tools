@@ -1,13 +1,13 @@
-# Make scenario — Email validation via DNS/MX (webhook)
+# Email validation via DNS/MX (webhook)
 
-A Make.com scenario blueprint that validates an email address over a **webhook** and
-returns a JSON verdict, for use as a **pre-screening** step other automations call. It
-mirrors the n8n "website check" pattern (webhook in → syntax gate → external check →
-branch → respond) but checks **email deliverability by resolving the domain's MX records
-over DNS-over-HTTPS**, with a **5-second timeout on the primary resolver (Google) and an
-automatic fallback to Cloudflare** — no third-party validation service, no API key.
+A **webhook automation** that validates an email address and returns a JSON verdict, for use
+as a **pre-screening** step other automations call. It checks **email deliverability by
+resolving the domain's MX records over DNS-over-HTTPS**, with a **5-second timeout on the
+primary resolver (Google) and an automatic fallback to Cloudflare** — no third-party
+validation service, no API key. The pattern is webhook in → syntax gate → external check →
+branch → respond.
 
-Two implementations of the **same logic and contract**:
+Shipped as two implementations of the **same logic and contract**:
 
 - **Make.com** — [`email-validation-dns.make-blueprint.json`](./email-validation-dns.make-blueprint.json) (verified live end-to-end)
 - **n8n** — [`email-validation-dns.n8n-workflow.json`](./email-validation-dns.n8n-workflow.json) (see "n8n version" below)
