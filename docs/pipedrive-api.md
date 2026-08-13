@@ -153,6 +153,18 @@ to request reads empty, so a **read-modify-write** concludes "unset" and overwri
 value. Any RMW against v2 needs an explicit field list - `?custom_fields=<hash>,<hash>` for
 custom fields and `?include_fields=<name>` for omitted native ones (e.g. `marketing_status`).
 
+### `source_lead_id` (the lead→deal link) lives only on the v1 deal
+
+The lead a deal was converted from is recorded as `source_lead_id`, but it is returned **only
+by the v1 deal** (`GET /v1/deals/{id}`) - **v2 omits it entirely**. Because v1 deal endpoints
+are on the retirement list, a recurring/scheduled scenario must **not** read it from v1.
+
+**Migration pattern (touch v1 exactly once):** copy `source_lead_id` into a custom **Text**
+field in a single backfill pass over the affected deals, reading from v1 just for that one run.
+The ongoing scenario then reads the custom field from **v2** and never calls a v1 deal endpoint.
+Only lead-sourced deals get a value - deals created directly stay blank, which is correct, not
+missing data. (Verify the custom field's key against the drift check like any other.)
+
 ### Enum options: resolve case-insensitively, fail on a miss
 
 Option labels must match exactly on the wire, but source systems disagree on casing (`TSgt`
