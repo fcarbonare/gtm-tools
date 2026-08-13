@@ -16,6 +16,7 @@ gtm-tools/
 │   └── pipedrive-config-sync/  # verify live Pipedrive config before referencing it
 ├── scripts/                    # standalone helper scripts (see scripts/README.md)
 ├── templates/                  # doc / config templates (see templates/README.md)
+│   └── email-validation-dns/   # Make.com + n8n webhook: email validation via DNS/MX
 ├── docs/
 │   ├── INSTALL.md              # install everything, or one skill at a time
 │   └── pipedrive-api.md        # Pipedrive API reference + v1 CRUD deprecation policy
@@ -27,6 +28,14 @@ gtm-tools/
 | Skill | What it does |
 |-------|--------------|
 | [`pipedrive-config-sync`](skills/pipedrive-config-sync/) | Drift-checks a project's `pipedrive/*.csv` mirrors against live Pipedrive (custom fields incl. Projects, options, pipelines, stages, activity types, boards, phases), refreshes them, and creates deal filters and project boards/phases from per-project JSON config. Reads pipelines and stages from the v2 API - the v1 CRUD endpoints are being retired (see [docs/pipedrive-api.md](docs/pipedrive-api.md)). |
+
+## Templates
+
+Reusable automation blueprints and config skeletons (see [templates/](templates/)).
+
+| Template | What it is |
+|----------|------------|
+| [`email-validation-dns`](templates/email-validation-dns/) | Webhook-triggered **email pre-screening** — validates syntax, then resolves the domain's **MX records over DNS-over-HTTPS** (Google primary with a 5s timeout, automatic **Cloudflare fallback**) and returns a JSON verdict for other automations to consume. No third-party service or API key. Ships as both a **Make.com** scenario blueprint and an **n8n** workflow, both verified live end-to-end. |
 
 ## Install
 

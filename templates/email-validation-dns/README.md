@@ -7,7 +7,10 @@ branch → respond) but checks **email deliverability by resolving the domain's 
 over DNS-over-HTTPS**, with a **5-second timeout on the primary resolver (Google) and an
 automatic fallback to Cloudflare** — no third-party validation service, no API key.
 
-File: [`email-validation-dns.make-blueprint.json`](./email-validation-dns.make-blueprint.json)
+Two implementations of the **same logic and contract**:
+
+- **Make.com** — [`email-validation-dns.make-blueprint.json`](./email-validation-dns.make-blueprint.json) (verified live end-to-end)
+- **n8n** — [`email-validation-dns.n8n-workflow.json`](./email-validation-dns.n8n-workflow.json) (see "n8n version" below)
 
 ## What it checks
 
@@ -122,6 +125,47 @@ still **attach a webhook** and **send one sample** so `email` resolves downstrea
   string check (`contains(toString(...); "Answer")`) rather than field access.
 - In a **linear** flow a blocked filter stops the whole chain — so mutually-exclusive
   responses must each be on their **own router route**.
+
+## n8n version
+
+[`email-validation-dns.n8n-workflow.json`](./email-validation-dns.n8n-workflow.json) is the
+same logic and JSON contract as an n8n workflow. n8n expresses it more directly than Make —
+proper IF nodes, JavaScript expressions, and a real error output for the fallback:
+
+```
+Webhook (GET /webhook/email-validation, respond via node)
+  → Set "Prepare" (email + lowercased domain)
+  → IF "Check syntax"  (email includes "@" AND domain includes ".")
+       ├─ false → 400 · invalid_syntax
+       └─ true  → HTTP "Google DoH — MX" (timeout 5000ms, onError: continueErrorOutput)
+             ├─ output 0 (ok)    → IF "Google: has MX?" → 200 deliverable / 200 no MX (source: google)
+             └─ output 1 (error) → HTTP "Cloudflare DoH — MX" → IF "Cloudflare: has MX?" → 200 deliverable / 200 no MX (source: cloudflare)
+```
+
+Key points:
+- The fallback uses n8n's **error output** (`onError: "continueErrorOutput"`) on the Google
+  node — a timeout or connection failure routes to output 1 (Cloudflare); an NXDOMAIN is a
+  normal 200 and stays on output 0 (so Cloudflare only runs on a real Google failure).
+- Downstream responders read the original address via `$('Prepare').item.json.email`, since
+  the HTTP node replaces `$json` with the DoH response.
+- The Cloudflare node sets **Response Format = JSON** so its `application/dns-json` body is
+  parsed (n8n won't auto-parse that content-type either).
+
+**Verified live.** Built via the n8n Workflow SDK, published, and tested end-to-end against a
+live n8n instance — all four cases returned the expected status + JSON:
+
+| Input | Response |
+|-------|----------|
+| `test@gmail.com` | `200` · `{valid:true, reason:"mx_records", dns_status:0, source:"google"}` |
+| nonexistent domain | `200` · `{valid:false, reason:"no_mx_records", dns_status:3, source:"google"}` |
+| `notanemail` | `400` · `{valid:false, reason:"invalid_syntax"}` |
+| via fallback (Google forced to fail) | `200` · `{..., source:"cloudflare"}` for both deliverable and no-MX |
+
+Node versions: `webhook` v2.1, `set` v3.4, `if` v2.3, `httpRequest` v4.4, `respondToWebhook`
+v1.5. Import via **Workflows → ⋯ → Import from File**, attach/confirm the webhook, and
+activate; the live URL is `https://<your-n8n>/webhook/email-validation`. Unlike the Make
+build, n8n's `responseFormat: JSON` on the Cloudflare node parses `application/dns-json`
+cleanly, so `dns_status` is populated on the fallback path too.
 
 ## Extending it
 

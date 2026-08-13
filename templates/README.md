@@ -6,4 +6,4 @@ and so on).
 
 | Template | What it is |
 |----------|------------|
-| [`email-validation-dns/`](email-validation-dns/) | Make.com scenario blueprint: webhook-triggered email validation that resolves the domain's **MX records over DNS-over-HTTPS** and returns a JSON verdict — a pre-screening step other automations call. No third-party service or API key. |
+| [`email-validation-dns/`](email-validation-dns/) | Webhook-triggered email validation that resolves the domain's **MX records over DNS-over-HTTPS** (Google primary with a 5s timeout, automatic **Cloudflare fallback**) and returns a JSON verdict — a pre-screening step other automations call. No third-party service or API key. Ships as a **Make.com** blueprint and an **n8n** workflow, both verified live. |

@@ -1,0 +1,185 @@
+{
+  "name": "Email validation (DNS/MX) — webhook",
+  "nodes": [
+    {
+      "id": "de635e7a-f03a-4465-89ab-be15ef46490e",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [0, 288],
+      "parameters": { "httpMethod": "GET", "path": "email-validation", "responseMode": "responseNode", "options": {} },
+      "webhookId": "1795cf50-65bb-428e-9cfa-b6363b6dff85"
+    },
+    {
+      "id": "719310cc-edbe-4da1-89df-b0e6779c9050",
+      "name": "Prepare",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [224, 288],
+      "parameters": {
+        "mode": "manual",
+        "includeOtherFields": true,
+        "assignments": {
+          "assignments": [
+            { "id": "asg-email", "name": "email", "value": "={{ ($json.query?.email ?? $json.body?.email ?? \"\").toString().trim() }}", "type": "string" },
+            { "id": "asg-domain", "name": "domain", "value": "={{ (($json.query?.email ?? $json.body?.email ?? \"\").toString().split(\"@\")[1] ?? \"\").trim().toLowerCase() }}", "type": "string" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "d8764ed6-c8ca-497b-b2d1-f7f53bfe4070",
+      "name": "Check syntax",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [448, 288],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "id": "c-syntax", "leftValue": "={{ $json.email.includes(\"@\") && $json.domain.includes(\".\") }}", "operator": { "type": "boolean", "operation": "true", "singleValue": true }, "rightValue": "" }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "f47a2afd-21a5-4324-aaac-279b05ecd08f",
+      "name": "Google DoH MX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [672, 192],
+      "onError": "continueErrorOutput",
+      "parameters": {
+        "method": "GET",
+        "url": "https://dns.google/resolve",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": { "parameters": [ { "name": "name", "value": "={{ $json.domain }}" }, { "name": "type", "value": "MX" } ] },
+        "options": { "timeout": 5000 }
+      }
+    },
+    {
+      "id": "77f1c54c-95b4-4509-88ec-dd517324d942",
+      "name": "Google has MX",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [896, 96],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "id": "c-gmx", "leftValue": "={{ $json.Answer }}", "operator": { "type": "array", "operation": "notEmpty", "singleValue": true }, "rightValue": "" }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "3fa5a10f-33ab-4845-b41a-229a4da41330",
+      "name": "200 deliverable Google",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1120, 0],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ email: $('Prepare').item.json.email, valid: true, reason: \"mx_records\", dns_status: $json.Status, source: \"google\", checked_at: $now.toISO() }) }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "ff7979da-b4c7-4c92-8b2e-742137baffa7",
+      "name": "200 no MX Google",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1120, 192],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ email: $('Prepare').item.json.email, valid: false, reason: \"no_mx_records\", dns_status: $json.Status, source: \"google\", checked_at: $now.toISO() }) }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "2932889f-4724-48c7-a7fa-3f4cad22d292",
+      "name": "Cloudflare DoH MX",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [896, 384],
+      "parameters": {
+        "method": "GET",
+        "url": "https://cloudflare-dns.com/dns-query",
+        "sendQuery": true,
+        "specifyQuery": "keypair",
+        "queryParameters": { "parameters": [ { "name": "name", "value": "={{ $('Prepare').item.json.domain }}" }, { "name": "type", "value": "MX" } ] },
+        "sendHeaders": true,
+        "specifyHeaders": "keypair",
+        "headerParameters": { "parameters": [ { "name": "accept", "value": "application/dns-json" } ] },
+        "options": { "timeout": 5000, "response": { "response": { "responseFormat": "json" } } }
+      }
+    },
+    {
+      "id": "ae58cf74-46fc-4203-8908-1fed10aca8cb",
+      "name": "Cloudflare has MX",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [1120, 384],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            { "id": "c-cmx", "leftValue": "={{ $json.Answer }}", "operator": { "type": "array", "operation": "notEmpty", "singleValue": true }, "rightValue": "" }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "3e3758f9-eee8-4773-a18f-fe2badfb241c",
+      "name": "200 deliverable Cloudflare",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1344, 288],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ email: $('Prepare').item.json.email, valid: true, reason: \"mx_records\", dns_status: $json.Status, source: \"cloudflare\", checked_at: $now.toISO() }) }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "256b957c-3c64-4246-aa78-94f5814e77a3",
+      "name": "200 no MX Cloudflare",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [1344, 480],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ email: $('Prepare').item.json.email, valid: false, reason: \"no_mx_records\", dns_status: $json.Status, source: \"cloudflare\", checked_at: $now.toISO() }) }}",
+        "options": { "responseCode": 200 }
+      }
+    },
+    {
+      "id": "7e484d81-4f9a-4d62-8731-7230adbb5f68",
+      "name": "400 invalid syntax",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [672, 384],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ ({ email: $json.email, valid: false, reason: \"invalid_syntax\", checked_at: $now.toISO() }) }}",
+        "options": { "responseCode": 400 }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [ [ { "node": "Prepare", "type": "main", "index": 0 } ] ] },
+    "Prepare": { "main": [ [ { "node": "Check syntax", "type": "main", "index": 0 } ] ] },
+    "Check syntax": { "main": [ [ { "node": "Google DoH MX", "type": "main", "index": 0 } ], [ { "node": "400 invalid syntax", "type": "main", "index": 0 } ] ] },
+    "Google DoH MX": { "main": [ [ { "node": "Google has MX", "type": "main", "index": 0 } ], [ { "node": "Cloudflare DoH MX", "type": "main", "index": 0 } ] ] },
+    "Google has MX": { "main": [ [ { "node": "200 deliverable Google", "type": "main", "index": 0 } ], [ { "node": "200 no MX Google", "type": "main", "index": 0 } ] ] },
+    "Cloudflare DoH MX": { "main": [ [ { "node": "Cloudflare has MX", "type": "main", "index": 0 } ] ] },
+    "Cloudflare has MX": { "main": [ [ { "node": "200 deliverable Cloudflare", "type": "main", "index": 0 } ], [ { "node": "200 no MX Cloudflare", "type": "main", "index": 0 } ] ] }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
