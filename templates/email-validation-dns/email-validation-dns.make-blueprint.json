@@ -1,0 +1,219 @@
+{
+  "name": "Email validation (DNS/MX) — webhook",
+  "flow": [
+    {
+      "id": 1,
+      "module": "gateway:CustomWebHook",
+      "version": 1,
+      "parameters": {},
+      "mapper": {},
+      "metadata": { "designer": { "x": 0, "y": 0, "name": "Webhook — email in" } }
+    },
+    {
+      "id": 2,
+      "module": "builtin:BasicRouter",
+      "version": 1,
+      "parameters": {},
+      "mapper": null,
+      "metadata": { "designer": { "x": 300, "y": 0, "name": "Syntax gate" } },
+      "routes": [
+        {
+          "flow": [
+            {
+              "id": 3,
+              "module": "http:ActionSendData",
+              "version": 3,
+              "parameters": { "handleErrors": true, "useNewZLibDeCompress": true },
+              "filter": {
+                "name": "Valid email syntax",
+                "conditions": [ [ { "a": "{{if(contains(1.email; \"@\") & contains(last(split(1.email; \"@\")); \".\"); \"ok\"; \"bad\")}}", "b": "ok", "o": "text:equal" } ] ]
+              },
+              "mapper": {
+                "url": "https://dns.google/resolve",
+                "method": "get",
+                "headers": [],
+                "qs": [
+                  { "name": "name", "value": "{{trim(lower(last(split(1.email; \"@\"))))}}" },
+                  { "name": "type", "value": "MX" }
+                ],
+                "bodyType": "",
+                "parseResponse": true,
+                "followRedirect": true,
+                "followAllRedirects": false,
+                "rejectUnauthorized": true,
+                "useMtls": false,
+                "gzip": true,
+                "useQuerystring": false,
+                "serializeUrl": false,
+                "timeout": 5,
+                "shareCookies": false,
+                "ca": ""
+              },
+              "onerror": [
+                { "id": 8, "module": "builtin:Resume", "version": 1, "mapper": {}, "metadata": { "designer": { "x": 600, "y": 600, "name": "Resume (Google failed → continue to Cloudflare)" } } }
+              ],
+              "metadata": { "designer": { "x": 600, "y": 0, "name": "DoH — Google (5s timeout)" } }
+            },
+            {
+              "id": 4,
+              "module": "builtin:BasicRouter",
+              "version": 1,
+              "parameters": {},
+              "mapper": null,
+              "metadata": { "designer": { "x": 900, "y": 0, "name": "Provider + MX result" } },
+              "routes": [
+                {
+                  "flow": [
+                    {
+                      "id": 5,
+                      "module": "gateway:WebhookRespond",
+                      "version": 1,
+                      "parameters": {},
+                      "filter": { "name": "Google: has MX", "conditions": [ [ { "a": "{{3.data.Answer}}", "o": "exist" } ] ] },
+                      "mapper": {
+                        "status": "200",
+                        "body": "{\"email\":\"{{1.email}}\",\"valid\":true,\"reason\":\"mx_records\",\"dns_status\":\"{{3.data.Status}}\",\"source\":\"google\",\"checked_at\":\"{{now}}\"}",
+                        "headers": [ { "key": "Content-Type", "value": "application/json" } ]
+                      },
+                      "metadata": { "designer": { "x": 1200, "y": -150, "name": "200 · deliverable (Google)" } }
+                    }
+                  ]
+                },
+                {
+                  "flow": [
+                    {
+                      "id": 6,
+                      "module": "gateway:WebhookRespond",
+                      "version": 1,
+                      "parameters": {},
+                      "filter": { "name": "Google: ran, no MX", "conditions": [ [ { "a": "{{3.data.Status}}", "o": "exist" }, { "a": "{{3.data.Answer}}", "o": "notexist" } ] ] },
+                      "mapper": {
+                        "status": "200",
+                        "body": "{\"email\":\"{{1.email}}\",\"valid\":false,\"reason\":\"no_mx_records\",\"dns_status\":\"{{3.data.Status}}\",\"source\":\"google\",\"checked_at\":\"{{now}}\"}",
+                        "headers": [ { "key": "Content-Type", "value": "application/json" } ]
+                      },
+                      "metadata": { "designer": { "x": 1200, "y": 0, "name": "200 · no MX (Google)" } }
+                    }
+                  ]
+                },
+                {
+                  "flow": [
+                    {
+                      "id": 9,
+                      "module": "http:ActionSendData",
+                      "version": 3,
+                      "parameters": { "handleErrors": true, "useNewZLibDeCompress": true },
+                      "filter": { "name": "Google failed → Cloudflare", "conditions": [ [ { "a": "{{3.data.Status}}", "o": "notexist" } ] ] },
+                      "mapper": {
+                        "url": "https://cloudflare-dns.com/dns-query",
+                        "method": "get",
+                        "headers": [ { "name": "accept", "value": "application/dns-json" } ],
+                        "qs": [
+                          { "name": "name", "value": "{{trim(lower(last(split(1.email; \"@\"))))}}" },
+                          { "name": "type", "value": "MX" }
+                        ],
+                        "bodyType": "",
+                        "parseResponse": false,
+                        "followRedirect": true,
+                        "followAllRedirects": false,
+                        "rejectUnauthorized": true,
+                        "useMtls": false,
+                        "gzip": true,
+                        "useQuerystring": false,
+                        "serializeUrl": false,
+                        "timeout": 5,
+                        "shareCookies": false,
+                        "ca": ""
+                      },
+                      "metadata": { "designer": { "x": 1200, "y": 300, "name": "DoH fallback — Cloudflare" } }
+                    },
+                    {
+                      "id": 12,
+                      "module": "builtin:BasicRouter",
+                      "version": 1,
+                      "parameters": {},
+                      "mapper": null,
+                      "metadata": { "designer": { "x": 1500, "y": 300, "name": "Cloudflare MX result" } },
+                      "routes": [
+                        {
+                          "flow": [
+                            {
+                              "id": 10,
+                              "module": "gateway:WebhookRespond",
+                              "version": 1,
+                              "parameters": {},
+                              "filter": { "name": "Cloudflare: has MX", "conditions": [ [ { "a": "{{if(contains(toString(9.data); \"Answer\"); \"yes\"; \"no\")}}", "b": "yes", "o": "text:equal" } ] ] },
+                              "mapper": {
+                                "status": "200",
+                                "body": "{\"email\":\"{{1.email}}\",\"valid\":true,\"reason\":\"mx_records\",\"dns_status\":\"\",\"source\":\"cloudflare\",\"checked_at\":\"{{now}}\"}",
+                                "headers": [ { "key": "Content-Type", "value": "application/json" } ]
+                              },
+                              "metadata": { "designer": { "x": 1800, "y": 225, "name": "200 · deliverable (Cloudflare)" } }
+                            }
+                          ]
+                        },
+                        {
+                          "flow": [
+                            {
+                              "id": 11,
+                              "module": "gateway:WebhookRespond",
+                              "version": 1,
+                              "parameters": {},
+                              "filter": { "name": "Cloudflare: no MX", "conditions": [ [ { "a": "{{if(contains(toString(9.data); \"Answer\"); \"yes\"; \"no\")}}", "b": "yes", "o": "text:notequal" } ] ] },
+                              "mapper": {
+                                "status": "200",
+                                "body": "{\"email\":\"{{1.email}}\",\"valid\":false,\"reason\":\"no_mx_records\",\"dns_status\":\"\",\"source\":\"cloudflare\",\"checked_at\":\"{{now}}\"}",
+                                "headers": [ { "key": "Content-Type", "value": "application/json" } ]
+                              },
+                              "metadata": { "designer": { "x": 1800, "y": 375, "name": "200 · no MX (Cloudflare)" } }
+                            }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "flow": [
+            {
+              "id": 7,
+              "module": "gateway:WebhookRespond",
+              "version": 1,
+              "parameters": {},
+              "filter": {
+                "name": "Malformed email",
+                "conditions": [ [ { "a": "{{if(contains(1.email; \"@\") & contains(last(split(1.email; \"@\")); \".\"); \"ok\"; \"bad\")}}", "b": "ok", "o": "text:notequal" } ] ]
+              },
+              "mapper": {
+                "status": "400",
+                "body": "{\"email\":\"{{1.email}}\",\"valid\":false,\"reason\":\"invalid_syntax\",\"checked_at\":\"{{now}}\"}",
+                "headers": [ { "key": "Content-Type", "value": "application/json" } ]
+              },
+              "metadata": { "designer": { "x": 600, "y": 300, "name": "400 · invalid syntax" } }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "instant": true,
+    "version": 1,
+    "scenario": {
+      "roundtrips": 1,
+      "maxErrors": 3,
+      "autoCommit": true,
+      "autoCommitTriggerLast": true,
+      "sequential": false,
+      "confidential": false,
+      "dataloss": false,
+      "dlq": false,
+      "freshVariables": false
+    },
+    "designer": { "orphans": [] }
+  }
+}

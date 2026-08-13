@@ -4,4 +4,6 @@ Reusable document and config templates (SOPs, spec skeletons, Make.com scenario
 blueprints, per-project config samples such as Pipedrive `filters.json` / `projects.json`,
 and so on).
 
-_None yet - add them here._
+| Template | What it is |
+|----------|------------|
+| [`email-validation-dns/`](email-validation-dns/) | Make.com scenario blueprint: webhook-triggered email validation that resolves the domain's **MX records over DNS-over-HTTPS** and returns a JSON verdict — a pre-screening step other automations call. No third-party service or API key. |
