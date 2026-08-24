@@ -8,6 +8,8 @@ A **distribution repo** for reusable go-to-market tooling — Claude Code skills
 scripts, and templates for a Pipedrive / Make.com / Apollo / CloudTalk / BigQuery stack.
 There is no build, no package.json, no test suite, and no dependencies: the only code is
 `skills/pipedrive-config-sync/pipedrive-sync.mjs`, plain Node 14+ ESM using `https` and `fs`.
+(The `pipedrive-automations` skill is documentation-only — it owns the design knowledge and
+defers all API reading, including the automation mirror, to `pipedrive-config-sync`.)
 
 The important consequence of that: **this repo produces nothing that runs here.** Everything
 is consumed from *other* project repos, which hold the per-project state (the `pipedrive/`
@@ -32,21 +34,28 @@ project-agnostic.
 ls -l ~/.claude/skills                    # verify; then /skills in Claude Code
 ```
 
-## Running the one script
+## Running the script
 
-It is never run from this repo — run it from the project whose Pipedrive config you're
-checking:
+It is never run from this repo — run it from the project whose Pipedrive account you're
+working on. One script, `pipedrive-sync.mjs`, with subcommands for every entity it reads,
+including the automation mirror:
 
 ```bash
 SYNC=~/.claude/skills/pipedrive-config-sync/pipedrive-sync.mjs
-node $SYNC                  # drift check (read-only GETs); exit 1 = drift, 0 = in sync, 2 = error
+node $SYNC                  # config drift check (read-only GETs); exit 1 = drift, 0 = in sync, 2 = error
 node $SYNC --write          # refresh the project's pipedrive/*.csv mirrors from live
 node $SYNC --json           # machine-readable drift report
 node $SYNC filters list|ensure    # deal filters from pipedrive/filters.json (idempotent)
 node $SYNC projects list|ensure   # boards/phases from pipedrive/projects.json (idempotent)
 node $SYNC filters ensure --dry-run   # preview: resolve/validate against live, write nothing
 node $SYNC projects ensure --dry-run  # preview boards/phases/reference projects, write nothing
+node $SYNC automations      # drift-check the native-automation mirror (read-only; no write endpoint)
+node $SYNC automations --write  # refresh <mirror>/automations/ (one JSON per rule + index.md/json)
+node $SYNC automations --json   # machine-readable automation summary
 ```
+
+The `pipedrive-automations` skill is documentation-only and runs nothing; it defers the
+mirror above to this script.
 
 Token: `PIPEDRIVE_API_TOKEN` from the environment, or `.env` / `.env.local` at the project
 root or in the mirror dir (`.env.local` wins). All gitignored. Never hardcode or print it.
@@ -89,6 +98,45 @@ They only ever **create** what's missing — never rename, reorder, or delete. `
 commands must stay safe to re-run. Both accept **`--dry-run`**, which still does the
 read-only resolution (field/option-name → id, existing-item lookup) but creates nothing;
 keep the non-dry-run output path byte-identical when touching these functions.
+
+### The `automations` subcommand (native-automation mirror)
+
+`node pipedrive-sync.mjs automations` mirrors an account's native workflow automations into
+`<mirror>/automations/` and is deliberately **read-only** — Pipedrive exposes no write endpoint
+for automations, so the design is *build in the UI, mirror by API, diff in git*. It is a
+subcommand of the same script (like `filters` / `projects`), reusing `httpsGetJson`, `loadToken`,
+`MIRROR_DIR` and the rate-limit helpers, so it behaves identically to the rest of the tool. The
+design knowledge for the automations themselves lives in the separate `pipedrive-automations`
+skill; this is only the read side.
+
+The non-obvious parts:
+
+**The endpoint is singular and undocumented.** `GET /api/v2/automation/workflow`; the plural
+`/automations` 404s. On any fetch failure the subcommand exits **2** ("could not check"), never
+1 ("everything was deleted") — a Pipedrive-side change to an undocumented path must not read
+as a mass deletion. Same `success:false`-on-HTTP-200 trap as the rest of the script;
+`httpsGetJson` rejects on it.
+
+**`context` splits two things sharing one endpoint.** `context: "automation"` is a workflow
+rule; `context: "automatic-assignment"` is the separate assignment tool (its record carries a
+literal string where a uuid belongs). `mirrorAutomations` filters to `automation` or it miscounts.
+
+**Webhook resolution is optional and degrades.** A webhook action step carries a webhook id,
+not a URL, so `/v1/webhooks` is read to name destinations in the index — but that endpoint
+is unavailable on some accounts (permissions/plan). On failure it `(warn)`s, writes the mirror
+without it, and never reports a pre-existing `webhooks.json` as removed. Preserve this
+degrade-never-fail pattern, mirroring config-sync's optional endpoints.
+
+**Credentials are stripped before git.** An inline `Basic`/`Bearer` string anywhere in a
+definition is redacted one-way (there's no write endpoint to inject back into), and webhooks'
+write-only `http_auth_*` fields are dropped rather than mirrored as a misleading `null`. Keep
+any new field that could carry a secret out of the committed mirror.
+
+**Decode by trailing key, not full resource id.** `dynamicRegistry.eventFields` is keyed by the
+full `dynamic-event-field@…/{hash}` id while `triggerFieldResourceIds` uses a different prefix
+for the same field; the label sits at `.field.label`, not `.label`. Match on the trailing hash
+or the index renders bare 40-char keys that look resolved but aren't. Labels are a snapshot from
+when the rule was saved, so the index warns to grep the key, not the label.
 
 ## Pipedrive API rules (non-negotiable)
 

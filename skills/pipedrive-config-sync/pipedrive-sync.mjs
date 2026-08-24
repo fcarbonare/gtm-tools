@@ -4,7 +4,10 @@
  *
  * Bundled with the `pipedrive-config-sync` skill. Project-agnostic: it detects when
  * the live Pipedrive configuration has drifted from a project's local mirror files,
- * refreshes them, and manages deal filters.
+ * refreshes them, manages deal filters, and mirrors native workflow automations
+ * (read-only) via the `automations` subcommand. This is the skill that reads and updates
+ * Pipedrive entities over the API; the separate `pipedrive-automations` skill is where the
+ * automations themselves are scoped, planned and validated.
  *
  * Mirror directory resolution (never next to this script):
  *   1. $PIPEDRIVE_MIRROR_DIR
@@ -29,6 +32,7 @@
  *   config : pipelines (v2), stages (v2), activityTypes (v1), boards + phases (v2 beta; optional)
  *   filters: filters (v1, GET/POST)
  *   projects: boards + phases (v2, GET/POST); templates/tasks/plan (v1)
+ *   automations: automation/workflow (v2, GET; undocumented singular path, read-only), webhooks (v1, GET; optional)
  *
  * API version policy (Pipedrive v1 CRUD deprecation):
  *   Pipedrive is retiring the v1 CRUD endpoints for activities, deals, persons,
@@ -49,6 +53,9 @@
  *   node pipedrive-sync.mjs filters ensure [--dry-run]   # create filters from <mirror>/filters.json (idempotent)
  *   node pipedrive-sync.mjs projects list            # list project boards + phases
  *   node pipedrive-sync.mjs projects ensure [--dry-run]  # create boards + phases from <mirror>/projects.json (idempotent)
+ *   node pipedrive-sync.mjs automations              # drift-check the native-automation mirror (read-only)
+ *   node pipedrive-sync.mjs automations --write      # refresh <mirror>/automations/ (one JSON per rule + index)
+ *   node pipedrive-sync.mjs automations --json       # machine-readable automation summary
  *
  * Token: PIPEDRIVE_API_TOKEN in the environment, or in .env / .env.local at the project
  * root or in the mirror dir (all gitignored; .env.local wins). The token is sent only to
@@ -56,7 +63,7 @@
  */
 
 import https from 'https';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, resolve } from 'path';
 
@@ -858,6 +865,206 @@ function writeMirrors(live, localFields, localOptions) {
   };
 }
 
+/* --------------------------------------------------------- automations mirror */
+/* Native workflow automations are readable over an undocumented, singular path:
+   GET /api/v2/automation/workflow (the plural /automations 404s). There is NO write endpoint,
+   so this mirrors read-only into <mirror>/automations/ - one JSON per rule plus an index -
+   so an inherited set can be transcribed, diffed and reviewed in git. Proven live 2026-08-21;
+   undocumented, therefore unsupported, therefore it can move. On any fetch failure we exit 2
+   ("could not check"), never 1 ("everything was deleted"). Design/planning guidance for the
+   automations themselves lives in the separate `pipedrive-automations` skill; the API mechanics
+   and audit recipes are in reading-automations.md next to this script. */
+const AUTOMATIONS_DIR = join(MIRROR_DIR, 'automations');
+
+/* Strip inline credentials before anything reaches git. A definition can carry an HTTP
+   Basic/Bearer string inline (webhook auth, custom-header actions). One-way only - there is no
+   write endpoint to inject them back into. Webhook records also have their write-only http_auth_*
+   fields dropped below. */
+const AUTO_CRED_RE = /(?:Basic|Bearer)\s+[A-Za-z0-9+/._~-]{8,}={0,2}/g;
+function redactCreds(node) {
+  if (typeof node === 'string') { AUTO_CRED_RE.lastIndex = 0; return node.replace(AUTO_CRED_RE, '<REDACTED-CREDENTIAL>'); }
+  if (Array.isArray(node)) return node.map(redactCreds);
+  if (node && typeof node === 'object') {
+    const out = {};
+    for (const k of Object.keys(node)) out[k] = redactCreds(node[k]);
+    return out;
+  }
+  return node;
+}
+
+/* Key-sorted, so a mirror diff shows a real change rather than whatever order the API happened
+   to serialise a map in this morning. */
+const autoStable = (v) => JSON.stringify(v, (_k, x) =>
+  (x && typeof x === 'object' && !Array.isArray(x))
+    ? Object.fromEntries(Object.keys(x).sort().map((k) => [k, x[k]]))
+    : x, 1) + '\n';
+
+const autoSlug = (s) => (s || 'untitled').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60);
+
+function describeAutomation(w, hookById) {
+  // Two traps in one lookup. The label sits at `.field.label`, NOT `.label`, and `eventFields`
+  // is keyed by the full `dynamic-event-field@...` resource id while `triggerFieldResourceIds`
+  // lists a different prefix for the same field. Matching the whole string resolves nothing and
+  // renders a mirror full of bare 40-char hashes that looks like it worked. Match the trailing key.
+  const bySuffix = new Map(
+    Object.entries((w.dynamicRegistry && w.dynamicRegistry.eventFields) || {})
+      .map(([rid, e]) => [rid.split('/').pop(), e && e.field && e.field.label])
+      .filter(([, l]) => l));
+  const label = (rid) => bySuffix.get(String(rid).split('/').pop()) || String(rid).split('/').pop();
+  const steps = Object.values(w.steps || {});
+  const trigger = steps.find((s) => s.type === 'trigger');
+  const watched = ((trigger && trigger.configuration && trigger.configuration.triggerFieldResourceIds) || []).map(String);
+  const dests = steps
+    .filter((s) => s.type === 'action' && /webhook/i.test((s.action && s.action.resourceId) || ''))
+    .flatMap((s) => ((s.action.inputs && s.action.inputs.webhook) || []).map((i) => i.inputValue))
+    .map((id) => (hookById.get(id) && hookById.get(id).name) || `webhook ${id}`);
+  return {
+    uuid: w.uuid,
+    name: w.name,
+    trigger: (trigger && trigger.event && trigger.event.resourceId) || (steps.some((s) => s.type === 'date-trigger') ? 'scheduled' : ''),
+    watched_keys: watched.map((x) => x.split('/').pop()),
+    watched_labels: watched.map(label),
+    // Counts every branch: an IF/ELSE rule reads as a short chain until fallbackStepId is
+    // followed, so step COUNT is the honest summary and "next step" is not.
+    steps: steps.length,
+    posts_to: [...new Set(dests)],
+    updated: (w.lastUpdateDate || '').slice(0, 10),
+  };
+}
+
+function buildAutomationsIndexMd(rows, others, hooks, hooksAvailable) {
+  const REGISTRY_WARNING = "⚠️ **Field labels below come from each rule's own `dynamicRegistry`, "
+    + 'which is a snapshot from when that rule was last saved.** On an account with duplicate field '
+    + 'names the label is exactly what cannot tell the twins apart. Grep the key, not the label.';
+  return [
+    '# Pipedrive automations',
+    '',
+    'Mirrored by `node pipedrive-sync.mjs automations --write` (the `pipedrive-config-sync` skill). Read-only: there is no write endpoint, so this records what exists and git records what changed. Design and validate the rules themselves with the `pipedrive-automations` skill.',
+    '',
+    `${rows.length} automation${rows.length === 1 ? '' : 's'}${others ? `, plus ${others} record(s) under \`context: automatic-assignment\` which the automations screen never lists` : ''}.`,
+    '',
+    REGISTRY_WARNING,
+    '',
+    '| Automation | Trigger | Watches | Posts to | Steps | Updated |',
+    '|---|---|---|---|---|---|',
+    ...rows.map((r) => `| [${r.name}](${autoSlug(r.name)}.json) | ${r.trigger.replace('event@php-app:', '') || '-'} | ${r.watched_labels.join(', ') || '-'} | ${r.posts_to.join(', ') || '-'} | ${r.steps} | ${r.updated} |`),
+    '',
+    '## Watched field keys',
+    '',
+    'Grep these to answer "is it safe to rename or delete this field" - the automation UI has no usage view.',
+    '',
+    '| Field | Watched by |',
+    '|---|---|',
+    ...[...new Set(rows.flatMap((r) => r.watched_keys.map((k, i) => `${k}\t${r.watched_labels[i]}`)))]
+      .sort()
+      .map((pair) => {
+        const [key, lab] = pair.split('\t');
+        const by = rows.filter((r) => r.watched_keys.includes(key)).map((r) => r.name);
+        return `| \`${key}\`${lab !== key ? ` (${lab})` : ''} | ${by.join(', ')} |`;
+      }),
+    '',
+    '## Webhook destinations',
+    '',
+    hooksAvailable
+      ? 'Resolved from `/v1/webhooks`, because a webhook step in a definition carries an id rather than a URL. `last_http_status` and `last_delivery` are the cheapest health signal available: a delivery that stopped shows up here before anyone notices the automation stopped working.'
+      : '_The webhooks endpoint was unavailable on this account (permissions or plan), so webhook destinations could not be resolved. The automations above are still complete; only the id-to-URL lookup is missing._',
+    '',
+    ...(hooksAvailable ? [
+      '| Webhook | Destination | Active | Last status | Last delivery |',
+      '|---|---|---|---|---|',
+      ...hooks.map((h) => `| ${h.name} (${h.id}) | \`${(h.subscription_url || '').replace(/\?$/, '')}\` | ${h.is_active ? 'yes' : 'NO'} | ${h.last_http_status ?? '-'} | ${(h.last_delivery_time || '-').slice(0, 16)} |`),
+      '',
+      '⚠️ **Whether a webhook is authenticated cannot be read back, from the API or the UI.** `http_auth_user` and `http_auth_password` are write-only, enterable only when the webhook is registered, and are dropped from `webhooks.json` rather than mirrored as a misleading `null`. The only after-the-fact evidence that a webhook is authenticated is the receiving end having passed its auth check and done real work.',
+      '',
+    ] : []),
+  ].join('\n');
+}
+
+async function mirrorAutomations(token, { write, json }) {
+  // `data.docs`, not `data`. And `context` splits two things sharing one endpoint: "automation"
+  // is a workflow rule, "automatic-assignment" is the separate assignment tool, whose record
+  // carries a literal string where a uuid belongs and which the automations screen never lists.
+  let list;
+  try {
+    const j = await httpsGetJson(`${BASE_V2}/automation/workflow?limit=200`, token);
+    list = (j.data && j.data.docs) || [];
+  } catch (e) {
+    console.error(`Cannot read automations: ${e.message}`);
+    console.error('The path is undocumented (GET /api/v2/automation/workflow, singular). If it moved,');
+    console.error('find the new one in the browser network panel and update this script.');
+    process.exit(2);
+  }
+  const rules = list.filter((d) => d.context === 'automation');
+  const others = list.length - rules.length;
+
+  const full = [];
+  try {
+    for (const r of rules) full.push((await httpsGetJson(`${BASE_V2}/automation/workflow/${r.uuid}`, token)).data);
+  } catch (e) {
+    console.error(`Cannot read an automation definition: ${e.message}`);
+    process.exit(2);
+  }
+
+  // Optional: resolve webhook ids to names/URLs for the index. If the endpoint is unavailable
+  // (permissions, plan), degrade - never fail the mirror.
+  let hooks = [];
+  let hooksAvailable = true;
+  try {
+    hooks = (await httpsGetJson(`${BASE_V1}/webhooks`, token)).data || [];
+  } catch (e) {
+    hooksAvailable = false;
+    console.error(`(warn) webhook destinations not resolved: ${e.message}`);
+  }
+  const hookById = new Map(hooks.map((w) => [w.id, w]));
+  const safeHooks = hooks.map(({ http_auth_user, http_auth_password, ...keep }) => keep);
+
+  const rows = full.map((w) => describeAutomation(w, hookById)).sort((a, b) => a.name.localeCompare(b.name));
+
+  if (json) {
+    console.log(JSON.stringify({ count: rows.length, other_context: others, webhooks_resolved: hooksAvailable, automations: rows }, null, 2));
+    process.exit(0);
+  }
+
+  const files = new Map();
+  for (const w of full) files.set(`${autoSlug(w.name)}.json`, autoStable(redactCreds(w)));
+  if (hooksAvailable) files.set('webhooks.json', autoStable(redactCreds(safeHooks)));
+  files.set('index.json', autoStable(rows));
+  files.set('index.md', buildAutomationsIndexMd(rows, others, hooks, hooksAvailable));
+
+  if (!write) {
+    mkdirSync(AUTOMATIONS_DIR, { recursive: true });
+    const have = new Set(readdirSync(AUTOMATIONS_DIR));
+    const changed = [];
+    for (const [name, body] of files) {
+      const p = join(AUTOMATIONS_DIR, name);
+      if (!existsSync(p)) changed.push(`new      ${name}`);
+      else if (readFileSync(p, 'utf8') !== body) changed.push(`changed  ${name}`);
+      have.delete(name);
+    }
+    // Don't report a pre-existing webhooks.json as removed when webhook resolution degraded.
+    for (const gone of have) {
+      if (gone === 'webhooks.json' && !hooksAvailable) continue;
+      changed.push(`removed  ${gone}`);
+    }
+    console.log(`${rows.length} automation${rows.length === 1 ? '' : 's'} on the account, mirror at ${AUTOMATIONS_DIR}`);
+    if (!changed.length) { console.log('in sync'); process.exit(0); }
+    changed.forEach((c) => console.log(`  ${c}`));
+    console.log('\nstale - run with: pipedrive-sync.mjs automations --write');
+    process.exit(1);
+  }
+
+  mkdirSync(AUTOMATIONS_DIR, { recursive: true });
+  for (const gone of readdirSync(AUTOMATIONS_DIR)) {
+    if (files.has(gone)) continue;
+    if (gone === 'webhooks.json' && !hooksAvailable) continue; // don't delete what we couldn't refresh
+    rmSync(join(AUTOMATIONS_DIR, gone));
+  }
+  for (const [name, body] of files) writeFileSync(join(AUTOMATIONS_DIR, name), body);
+  console.log(`wrote ${files.size} file(s) to ${AUTOMATIONS_DIR}`);
+  console.log('Review the git diff before committing.');
+  process.exit(0);
+}
+
 /* ------------------------------------------------------------------ main */
 async function main() {
   const token = loadToken();
@@ -893,6 +1100,13 @@ async function main() {
       process.exit(2);
     }
     process.exit(0);
+  }
+
+  // automations subcommand: mirror native workflow automations (read-only; no write endpoint).
+  // Its own drift check / --write / --json, separate from the CSV config drift check below.
+  if (SUBCMD === 'automations') {
+    await mirrorAutomations(token, { write: WRITE, json: JSON_OUT });
+    return; // mirrorAutomations exits the process
   }
 
   console.log(`Mirror dir: ${MIRROR_DIR}`);

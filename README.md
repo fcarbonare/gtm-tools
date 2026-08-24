@@ -13,7 +13,8 @@ client projects and drift out of sync. Skills here are **global** - install them
 ```
 gtm-tools/
 ├── skills/                     # Claude Code skills (install into ~/.claude/skills)
-│   └── pipedrive-config-sync/  # verify live Pipedrive config before referencing it
+│   ├── pipedrive-config-sync/  # read/verify/mirror live Pipedrive config + automations
+│   └── pipedrive-automations/  # scope, plan + validate native Pipedrive automations
 ├── scripts/                    # standalone helper scripts (see scripts/README.md)
 ├── templates/                  # doc / config templates (see templates/README.md)
 │   └── email-validation-dns/   # Make.com + n8n webhook: email validation via DNS/MX
@@ -27,7 +28,8 @@ gtm-tools/
 
 | Skill | What it does |
 |-------|--------------|
-| [`pipedrive-config-sync`](skills/pipedrive-config-sync/) | Drift-checks a project's `pipedrive/*.csv` mirrors against live Pipedrive (custom fields incl. Projects, options, pipelines, stages, activity types, boards, phases), refreshes them, and creates deal filters and project boards/phases from per-project JSON config. Reads pipelines and stages from the v2 API - the v1 CRUD endpoints are being retired (see [docs/pipedrive-api.md](docs/pipedrive-api.md)). |
+| [`pipedrive-config-sync`](skills/pipedrive-config-sync/) | The skill that **reads, verifies and mirrors live Pipedrive over the API**. Drift-checks a project's `pipedrive/*.csv` mirrors (custom fields incl. Projects, options, pipelines, stages, activity types, boards, phases), refreshes them, creates deal filters and project boards/phases from per-project JSON, and mirrors native **workflow automations** read-only via the `automations` subcommand (`GET /api/v2/automation/workflow`, singular) so an inherited set can be diffed in git. Reads pipelines and stages from the v2 API - the v1 CRUD endpoints are being retired (see [docs/pipedrive-api.md](docs/pipedrive-api.md)). |
+| [`pipedrive-automations`](skills/pipedrive-automations/) | **Scope, plan and validate** native Pipedrive **workflow automations** - the design knowledge, no API access of its own. Covers the cardinality rule (many-to-one writes only), bind-then-wait for cross-object events, `IF/ELSE` branching, filters-as-conditions, and the silent condition traps (empty≠No, `contains` substring matches, timezone drift). To read or mirror an existing set it defers to `pipedrive-config-sync` (`automations` subcommand); mirror there, judge here. |
 
 ## Templates
 

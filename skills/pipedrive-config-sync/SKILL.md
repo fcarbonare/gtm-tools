@@ -12,9 +12,13 @@ description: >-
   field mapping - basically any time a project's local pipedrive/*.csv mirror files
   might be out of date. It runs the bundled pipedrive-sync.mjs to detect drift,
   refresh the mirrors (--write), manage deal filters, create project boards and
-  phases, and flag orphaned options whose parent field was deleted. Always run the
-  drift check before trusting a field key, so an automation never maps to a stale
-  or deleted field.
+  phases, flag orphaned options whose parent field was deleted, and mirror native
+  workflow automations read-only (the `automations` subcommand) so an inherited set
+  can be transcribed, diffed and reviewed in git. This is the skill that reads and
+  updates Pipedrive entities over the API; scoping, designing and validating the
+  automations themselves is the separate `pipedrive-automations` skill. Always run
+  the drift check before trusting a field key, so an automation never maps to a
+  stale or deleted field.
 ---
 
 # Pipedrive Config Sync
@@ -93,6 +97,9 @@ node $SYNC filters ensure --dry-run # preview: resolve/validate against live, cr
 node $SYNC projects list            # list project boards and their phases with ids
 node $SYNC projects ensure          # create boards + phases + reference projects/tasks from pipedrive/projects.json (idempotent)
 node $SYNC projects ensure --dry-run # preview what would be created, write nothing
+node $SYNC automations              # drift-check the native-automation mirror (read-only), exit 1 if stale
+node $SYNC automations --write      # refresh <mirror>/automations/ (one JSON per rule + index.md/json)
+node $SYNC automations --json       # machine-readable automation summary
 ```
 
 The local mirror files the script maintains, in the project's `pipedrive/`:
@@ -108,6 +115,7 @@ The local mirror files the script maintains, in the project's `pipedrive/`:
 | `phases.csv` | Project phases (id, name, board, order) |
 | `filters.json` | Deal-filter definitions for `filters ensure` (per project, optional) |
 | `projects.json` | Board + phase (+ optional reference-project/task) definitions for `projects ensure` (per project, optional) |
+| `automations/` | Native-automation mirror written by `automations --write`: one JSON per rule, `webhooks.json`, and `index.md` / `index.json` |
 
 ## How to act on the output
 
@@ -252,6 +260,32 @@ via v1 `POST /tasks`, then placed under a phase via v1 `PUT /projects/{id}/plan/
 phase placement lives in the project **plan**, not on the task's own `phase_id` field
 (which reads null) - view it via the project plan or the Pipedrive UI.
 
+## Mirroring native automations
+
+`automations` mirrors the account's native **workflow automations** into
+`<mirror>/automations/` — one JSON file per rule, a `webhooks.json`, and an `index.md` /
+`index.json` that decodes each rule's trigger, the fields it watches, and where it posts. It is
+**read-only**: Pipedrive exposes no write endpoint for automations, so the model is *build in the
+UI, mirror by API, diff in git*.
+
+- `automations` alone is the drift check (read-only GETs; exit 1 when the mirror is stale, 0 in
+  sync, 2 on error). `automations --write` refreshes the mirror; `automations --json` prints a
+  machine-readable summary.
+- The endpoint is **undocumented and singular** — `GET /api/v2/automation/workflow` (the plural
+  `/automations` 404s). On any fetch failure the command exits **2** ("could not check"), never 1,
+  so a change to an undocumented path never reads as a mass deletion.
+- Inline credentials are **stripped before anything is written** (a `Basic`/`Bearer` string in a
+  definition becomes `<REDACTED-CREDENTIAL>`; webhooks' write-only `http_auth_*` fields are
+  dropped), and webhook resolution **degrades** (a `(warn)`, mirror still written) when the
+  optional `/v1/webhooks` read is unavailable.
+- Full API detail — paths, auth, response shapes, the execution-history and usage-caps endpoints,
+  and the audit recipes (resolve every id, read the mail template body, check whether a rule ever
+  fired) — is in [reading-automations.md](reading-automations.md).
+
+**This skill only *reads* automations. Scoping, designing, and validating the rules themselves —
+the cardinality rule, bind-then-wait, the condition traps — is the separate `pipedrive-automations`
+skill.** Mirror here, judge there.
+
 ## Typical flows
 
 **Designing a new automation (most common):**
@@ -297,11 +331,12 @@ phase placement lives in the project **plan**, not on the task's own `phase_id` 
   with a clear "beta may be disabled" message. Don't work around this - it means the
   account can't use the Projects API yet.
 - **Scope of the drift check.** It covers custom fields + options (all entities incl.
-  Project), pipelines, stages, activity types, and boards/phases. It does **not** track
-  goals, roles, teams, webhooks, lead labels, or seed records (orgs/persons/deals) - so
-  it won't flag drift in those. If an automation depends on one of them, verify it by
-  hand. (These are the entities a full-environment *installer* creates but this
-  verify-focused skill deliberately doesn't mirror.)
+  Project), pipelines, stages, activity types, and boards/phases. **Native automations are
+  mirrored by the separate `automations` subcommand, not the drift check.** It does **not**
+  track goals, roles, teams, lead labels, or seed records (orgs/persons/deals) - so it won't
+  flag drift in those. If an automation depends on one of them, verify it by hand. (These are
+  the entities a full-environment *installer* creates but this verify-focused skill
+  deliberately doesn't mirror.)
 - **Rate limits.** The HTTP helpers read Pipedrive's `x-ratelimit-remaining` /
   `x-ratelimit-reset` headers and pause when the per-company window is nearly spent. This
   matters because under a burst Pipedrive can return an **empty HTTP-200 body instead of a

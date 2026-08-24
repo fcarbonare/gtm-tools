@@ -70,6 +70,16 @@ time:
 
 - **pipedrive-config-sync** - needs Node 14+ (no npm dependencies) and a
   `PIPEDRIVE_API_TOKEN` in the environment or in a `.env` / `.env.local` at the project
-  root or its `pipedrive/` directory. See the skill's
-  [SKILL.md](../skills/pipedrive-config-sync/SKILL.md) for details, including the
-  Pipedrive **v1 CRUD deprecation policy** ([docs/pipedrive-api.md](pipedrive-api.md)).
+  root or its `pipedrive/` directory. Bundles `pipedrive-sync.mjs`, which also mirrors
+  native **workflow automations** read-only via its `automations` subcommand (into
+  `<mirror>/automations/`). See the skill's
+  [SKILL.md](../skills/pipedrive-config-sync/SKILL.md) and
+  [reading-automations.md](../skills/pipedrive-config-sync/reading-automations.md) for
+  details, including the Pipedrive **v1 CRUD deprecation policy**
+  ([docs/pipedrive-api.md](pipedrive-api.md)).
+
+- **pipedrive-automations** - documentation-only (no bundled script, no credentials): the
+  design knowledge for scoping, planning and validating native automations. It reads and
+  mirrors nothing itself - to mirror an existing set it defers to **pipedrive-config-sync**
+  (`node pipedrive-sync.mjs automations --write`), so install that too. See the skill's
+  [SKILL.md](../skills/pipedrive-automations/SKILL.md).
