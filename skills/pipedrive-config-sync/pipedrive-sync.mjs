@@ -66,6 +66,7 @@ import https from 'https';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, rmSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join, basename, resolve } from 'path';
+import { redactCreds, redactString } from './redact-creds.mjs';
 
 /* ---------------------------------------------------- mirror dir resolution */
 /* This script lives in the global skill directory, so mirrors are never written
@@ -877,20 +878,12 @@ function writeMirrors(live, localFields, localOptions) {
 const AUTOMATIONS_DIR = join(MIRROR_DIR, 'automations');
 
 /* Strip inline credentials before anything reaches git. A definition can carry an HTTP
-   Basic/Bearer string inline (webhook auth, custom-header actions). One-way only - there is no
+   Basic/Bearer string inline (webhook auth, custom-header actions), and a webhook that can only be
+   given a URL carries its token in the query string (`?token=...`). One-way only - there is no
    write endpoint to inject them back into. Webhook records also have their write-only http_auth_*
-   fields dropped below. */
-const AUTO_CRED_RE = /(?:Basic|Bearer)\s+[A-Za-z0-9+/._~-]{8,}={0,2}/g;
-function redactCreds(node) {
-  if (typeof node === 'string') { AUTO_CRED_RE.lastIndex = 0; return node.replace(AUTO_CRED_RE, '<REDACTED-CREDENTIAL>'); }
-  if (Array.isArray(node)) return node.map(redactCreds);
-  if (node && typeof node === 'object') {
-    const out = {};
-    for (const k of Object.keys(node)) out[k] = redactCreds(node[k]);
-    return out;
-  }
-  return node;
-}
+   fields dropped below. The rules live in redact-creds.mjs (tested there); they run on the final
+   text of every file as well as on the parsed definitions, because index.md prints each webhook's
+   subscription_url straight from the API response. */
 
 /* Key-sorted, so a mirror diff shows a real change rather than whatever order the API happened
    to serialise a map in this morning. */
@@ -1030,6 +1023,8 @@ async function mirrorAutomations(token, { write, json }) {
   if (hooksAvailable) files.set('webhooks.json', autoStable(redactCreds(safeHooks)));
   files.set('index.json', autoStable(rows));
   files.set('index.md', buildAutomationsIndexMd(rows, others, hooks, hooksAvailable));
+  // Last line of defence: whatever a file ended up containing, no credential or URL token reaches disk or the drift check.
+  for (const [name, body] of files) files.set(name, redactString(body));
 
   if (!write) {
     mkdirSync(AUTOMATIONS_DIR, { recursive: true });

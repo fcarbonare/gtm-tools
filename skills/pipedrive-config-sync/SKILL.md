@@ -275,8 +275,10 @@ UI, mirror by API, diff in git*.
   `/automations` 404s). On any fetch failure the command exits **2** ("could not check"), never 1,
   so a change to an undocumented path never reads as a mass deletion.
 - Inline credentials are **stripped before anything is written** (a `Basic`/`Bearer` string in a
-  definition becomes `<REDACTED-CREDENTIAL>`; webhooks' write-only `http_auth_*` fields are
-  dropped), and webhook resolution **degrades** (a `(warn)`, mirror still written) when the
+  definition becomes `<REDACTED-CREDENTIAL>`; a secret-named query parameter in a URL, `?token=`,
+  `access_token`, `api_key`, `key`, `secret`, `password`, `auth`, `signature` and the like, becomes
+  `<REDACTED-TOKEN>` in every written file including `index.md`; webhooks' write-only `http_auth_*`
+  fields are dropped; the rules and their tests are in `redact-creds.mjs`), and webhook resolution **degrades** (a `(warn)`, mirror still written) when the
   optional `/v1/webhooks` read is unavailable.
 - Full API detail — paths, auth, response shapes, the execution-history and usage-caps endpoints,
   and the audit recipes (resolve every id, read the mail template body, check whether a rule ever
